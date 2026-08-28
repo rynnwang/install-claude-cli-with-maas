@@ -1,0 +1,7 @@
+# Keep line endings sane across Windows/macOS/Linux checkouts.
+# Shell scripts MUST stay LF or they break on macOS/Linux (bad interpreter: bash\r).
+* text=auto eol=lf
+*.sh text eol=lf
+*.ps1 text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf

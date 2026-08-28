@@ -1,0 +1,14 @@
+# Never commit local runtime state or secrets produced by claude-maas
+config.env
+*.claude-maas.bak
+settings.json
+.claude/
+.config/claude-maas/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
