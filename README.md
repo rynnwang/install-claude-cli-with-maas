@@ -6,6 +6,8 @@
 
 - ✅ 一键安装 / 更新 Claude Code CLI（官方原生脚本或 npm）
 - ✅ 向导式填写 `ANTHROPIC_BASE_URL` / 鉴权 Token / 模型名
+- ✅ **内置常用 MaaS 平台**（万界方舟 / DeepSeek / Kimi / 智谱 / Anthropic 官方 / 自定义），选一下就填好 Base URL
+- ✅ **模型列表自管理**：不同 MaaS 的模型名不同，`claude-maas model add/rm/edit/primary/small` 命令随时增删改
 - ✅ 两种落地方式：写入 Claude Code 的 `settings.json`，或写入系统环境变量
 - ✅ 处理好 macOS / Linux / Windows 的环境变量差异
 - ✅ 内置连接自测（真实打一次 `/v1/messages`）
@@ -20,6 +22,8 @@
 
 - [快速开始](#快速开始)
 - [菜单说明](#菜单说明)
+- [内置 MaaS 平台](#内置-maas-平台)
+- [模型列表管理](#模型列表管理)
 - [两种写入方式怎么选](#两种写入方式怎么选)
 - [三大平台的环境变量差异](#三大平台的环境变量差异)
 - [`claude-maas` 管理命令](#claude-maas-管理命令)
@@ -76,10 +80,11 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; irm https://r
 
 ```
   1)  安装 / 更新 Claude Code CLI
-  2)  配置 MaaS 连接 (Base URL / Token / 模型)
+  2)  配置 MaaS 连接 (平台 / Token / 模型)
   3)  查看当前配置
   4)  测试连接
   5)  启动 Claude Code
+  6)  管理模型列表 (增 / 删 / 改 / 设主/快速)
   8)  安装 / 更新 "claude-maas" 管理命令
   9)  卸载 (配置 / 管理命令 / 可选卸载 CLI)
   0)  退出
@@ -88,12 +93,54 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; irm https://r
 | 项 | 作用 |
 |---|---|
 | **1 安装 / 更新** | 优先用官方原生安装脚本（`https://claude.ai/install.sh` / `install.ps1`，不需要 Node）；也可选 `npm i -g @anthropic-ai/claude-code`；或对已安装版本执行 `claude update`。 |
-| **2 配置 MaaS** | 依次问 `ANTHROPIC_BASE_URL`、鉴权方式（Bearer Token 或 API Key）、主模型、轻量模型；最后问写到哪（`settings.json` / 环境变量 / 都写）。Token 输入不回显，已有值直接回车保留。 |
-| **3 查看配置** | 分别显示 `settings.json`、受管环境变量文件、系统级环境变量、**当前终端**里已生效的值；密钥类自动打码。 |
+| **2 配置 MaaS** | ① 从[内置平台列表](#内置-maas-平台)选一个（自动填 Base URL）或选「自定义」；② 选鉴权方式（Bearer Token 或 API Key）；③ 从[模型列表](#模型列表管理)里选主模型 / 快速模型（也可现场输入新模型名，会自动加进列表）；④ 选写到哪（`settings.json` / 环境变量 / 都写）。Token 输入不回显，已有值直接回车保留。 |
+| **3 查看配置** | 分别显示 `settings.json`、受管环境变量文件、系统级环境变量、**当前终端**里已生效的值、以及模型列表（标注 `[主]` `[快速]`）；密钥类自动打码。 |
 | **4 测试连接** | 用「当前生效」的配置真实 `POST {BASE_URL}/v1/messages`（`max_tokens:1`），按 HTTP 状态码给出诊断（鉴权错 / 路径错 / 网络不通 / 模型名不对）。 |
 | **5 启动 Claude Code** | 先把受管配置加载进当前进程，再启动 `claude`，省得你为验证专门重开终端。 |
+| **6 管理模型列表** | 增 / 删 / 改模型名，把某个模型设为主模型（`ANTHROPIC_MODEL`）或快速模型（`ANTHROPIC_SMALL_FAST_MODEL`）。详见[模型列表管理](#模型列表管理)。 |
 | **8 安装管理命令** | 把脚本自身装成 `claude-maas`（见下）。 |
-| **9 卸载** | 逐项确认：清 `settings.json` 里的受管键、删环境变量、移除 shell 启动文件里的受管块、删配置目录、删管理命令，可选连 Claude Code 本体一起卸。 |
+| **9 卸载** | 逐项确认：清 `settings.json` 里的受管键、删环境变量、移除 shell 启动文件里的受管块、删配置目录（含模型列表）、删管理命令，可选连 Claude Code 本体一起卸。 |
+
+---
+
+## 内置 MaaS 平台
+
+配置 MaaS（菜单 `2`）时，第一步从预置列表里选，会自动填好 `ANTHROPIC_BASE_URL` 并给出获取 API Key 的链接：
+
+| 平台 | ANTHROPIC_BASE_URL | 获取 API Key |
+|---|---|---|
+| Anthropic 官方 | `https://api.anthropic.com` | https://console.anthropic.com/settings/keys |
+| **万界方舟 WanJie Ark** | `https://maas-openapi.wanjiedata.com/api/anthropic` | https://www.wjark.com/center/api-key |
+| DeepSeek | `https://api.deepseek.com/anthropic` | https://platform.deepseek.com/api_keys |
+| 月之暗面 Kimi / Moonshot | `https://api.moonshot.cn/anthropic` | https://platform.moonshot.cn/console/api-keys |
+| 智谱 GLM / BigModel | `https://open.bigmodel.cn/api/anthropic` | https://open.bigmodel.cn/usercenter/apikeys |
+| 自定义 / 其它 | 手动输入 | — |
+
+> ⚠️ 预置地址只是**便捷默认值**，各家路径/策略可能调整；请以对应平台官方文档为准。选中平台后 Base URL 仍可当场改。多数平台用 **Bearer Token**（写入 `ANTHROPIC_AUTH_TOKEN`）。
+
+---
+
+## 模型列表管理
+
+不同 MaaS 平台的模型名各不相同、而且更新频繁，所以本工具**不内置具体模型名**，改为让你自己维护一份列表，存放在：
+
+- macOS / Linux：`~/.config/claude-maas/models.txt`
+- Windows：`%USERPROFILE%\.config\claude-maas\models.txt`
+
+每行一个模型名。菜单 `6` 或下面的命令都能管理它；配置 MaaS 时的「主模型 / 快速模型」就是从这份列表里选（也可现场输入一个新名字，会自动加入列表）。
+
+```bash
+claude-maas models                      # 列出所有模型
+claude-maas model add glm-4.6 glm-4.5-air   # 添加（可一次多个）
+claude-maas model rm  glm-4.5-air        # 按名称删除
+claude-maas model rm  2                  # 或按序号删除
+claude-maas model edit glm-4.6 glm-4.6-latest   # 改名（会同步已设置的主/快速指针）
+claude-maas model primary glm-4.6-latest # 设为主模型   -> ANTHROPIC_MODEL
+claude-maas model small   glm-4.5-air    # 设为快速模型 -> ANTHROPIC_SMALL_FAST_MODEL
+claude-maas model menu                   # 打开交互式管理菜单
+```
+
+`model primary` / `model small` 会把选中的模型名写回你**已经保存过**的位置（`settings.json` 和/或环境变量文件）；如果你还没配置过 MaaS，会提示先跑一次菜单 `2`。
 
 ---
 
@@ -151,6 +198,7 @@ claude-maas config     # 配置 MaaS 连接
 claude-maas show       # 打印当前配置
 claude-maas test       # 测试到 MaaS 的连接
 claude-maas run        # 加载受管环境并启动 claude
+claude-maas models     # 列出模型；model add/rm/edit/primary/small 见「模型列表管理」
 claude-maas uninstall  # 移除配置 / 管理命令
 claude-maas help       # 帮助
 ```
@@ -159,7 +207,7 @@ claude-maas help       # 帮助
 
 ## 支持的配置项
 
-向导会直接问前 4 个；其余可按需在 `settings.json` 或环境变量里自行添加，`claude-maas` 也会一并展示 / 清理它们。
+向导会直接问前 4 个（其中两个模型名从[模型列表](#模型列表管理)里选）；其余可按需在 `settings.json` 或环境变量里自行添加，`claude-maas` 也会一并展示 / 清理它们。
 
 | 变量 | 说明 |
 |---|---|
@@ -217,6 +265,7 @@ claude-maas uninstall
 |---|---|---|
 | `~/.claude/settings.json` | 选「方式 A / 都写」 | 仅新增 / 更新 / 删除 `env` 下的受管键，其余原样保留；改前备份为 `settings.json.claude-maas.bak` |
 | `~/.config/claude-maas/config.env` | 选「方式 B / 都写」 | `KEY='value'` 形式，仅受管键；`chmod 600` |
+| `~/.config/claude-maas/models.txt` | 用菜单 `6` 或 `model` 命令 | 你的模型名列表，每行一个（纯本地，不影响任何环境） |
 | `~/.bashrc`、`~/.bash_profile`、`~/.zshrc`、`~/.profile` | 选「方式 B / 都写」（Unix） | 在 `# >>> claude-maas >>>` / `# <<< claude-maas <<<` 之间的一段；每个文件备份为 `<file>.claude-maas.bak` |
 | `~/.config/fish/config.fish` | 同上且检测到 fish | fish 语法的受管块 |
 | `~/.local/bin/claude-maas` | 安装管理命令（Unix） | 脚本副本 |

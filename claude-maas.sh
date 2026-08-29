@@ -25,8 +25,21 @@ SELF_INSTALL_PATH="$HOME/.local/bin/claude-maas"
 CLAUDE_SETTINGS_DIR="$HOME/.claude"
 CLAUDE_SETTINGS_FILE="$CLAUDE_SETTINGS_DIR/settings.json"
 
+MODELS_FILE="$CONFIG_DIR/models.txt"
+
 MARK_BEGIN="# >>> claude-maas >>>"
 MARK_END="# <<< claude-maas <<<"
+
+# Built-in MaaS presets: key|显示名|ANTHROPIC_BASE_URL|获取 Key / 文档地址
+# 仅为便捷起见预置；各家地址可能调整，以对应平台官方文档为准。
+PRESETS=(
+  "anthropic|Anthropic 官方|https://api.anthropic.com|https://console.anthropic.com/settings/keys"
+  "wanjie|万界方舟 WanJie Ark|https://maas-openapi.wanjiedata.com/api/anthropic|https://www.wjark.com/center/api-key"
+  "deepseek|DeepSeek|https://api.deepseek.com/anthropic|https://platform.deepseek.com/api_keys"
+  "moonshot|月之暗面 Kimi / Moonshot|https://api.moonshot.cn/anthropic|https://platform.moonshot.cn/console/api-keys"
+  "zhipu|智谱 GLM / BigModel|https://open.bigmodel.cn/api/anthropic|https://open.bigmodel.cn/usercenter/apikeys"
+  "custom|自定义 / 其它|-|-"
+)
 
 # Managed environment keys. Only these are ever written or removed by this tool.
 MANAGED_KEYS=(
@@ -206,18 +219,312 @@ load_cfg_into_map() {
   for k in "${MANAGED_KEYS[@]}"; do cfg_set "$k" "$(config_get "$k")"; done
 }
 
+# --------------------------------------------------------------------------- #
+# Model list  (~/.config/claude-maas/models.txt, one model name per line)
+# --------------------------------------------------------------------------- #
+models_all() {
+  [ -f "$MODELS_FILE" ] || return 0
+  # drop blank lines and comments, keep order, de-dup
+  awk 'NF && $0 !~ /^[[:space:]]*#/ && !seen[$0]++' "$MODELS_FILE"
+}
+
+models_count() { models_all | awk 'END{print NR+0}'; }
+
+models_has() {
+  local want="$1" m
+  while IFS= read -r m; do [ "$m" = "$want" ] && return 0; done < <(models_all)
+  return 1
+}
+
+models_save() {  # stdin -> file (atomic, de-duped, trimmed)
+  mkdir -p "$CONFIG_DIR"
+  local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/claude-maas.XXXXXX")"
+  awk 'NF && $0 !~ /^[[:space:]]*#/ && !seen[$0]++' > "$tmp"
+  mv "$tmp" "$MODELS_FILE"
+  chmod 600 "$MODELS_FILE" 2>/dev/null || true
+}
+
+models_add() {
+  local name; name="$(printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [ -z "$name" ] && { err "空的模型名"; return 1; }
+  if models_has "$name"; then warn "已存在: $name"; return 0; fi
+  mkdir -p "$CONFIG_DIR"
+  { models_all; printf '%s\n' "$name"; } | models_save
+  ok "已添加模型: $name"
+}
+
+models_remove() {  # arg: exact name OR 1-based index
+  local arg="$1" list target
+  list="$(models_all)"
+  [ -z "$list" ] && { warn "模型列表为空"; return 0; }
+  # resolve arg -> exact model name
+  if printf '%s' "$arg" | grep -qE '^[0-9]+$'; then
+    target="$(models_nth "$arg")"
+  else
+    target="$arg"
+  fi
+  if [ -z "$target" ] || ! models_has "$target"; then warn "未找到: $arg"; return 0; fi
+  models_all | grep -Fxv -- "$target" | models_save
+  ok "已删除: $target"
+  [ "$(effective_or_cfg ANTHROPIC_MODEL)" = "$target" ] && warn "注意: 主模型仍指向已删除的 '$target'，请用 6) 或 'model primary' 重设。"
+  [ "$(effective_or_cfg ANTHROPIC_SMALL_FAST_MODEL)" = "$target" ] && warn "注意: 快速模型仍指向已删除的 '$target'。"
+}
+
+models_rename() {
+  local old="$1" new="$2"
+  new="$(printf '%s' "$new" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [ -z "$new" ] && { err "用法: model edit <旧名> <新名>"; return 1; }
+  models_has "$old" || { err "未找到: $old"; return 1; }
+  models_all | awk -v o="$old" -v n="$new" '$0==o{print n; next} {print}' | models_save
+  ok "已改名: $old -> $new"
+  # keep the primary / small pointers in sync with whatever is already stored
+  local changed=0
+  load_cfg_effective
+  [ "$(cfg_get ANTHROPIC_MODEL)" = "$old" ] && { cfg_set ANTHROPIC_MODEL "$new"; changed=1; }
+  [ "$(cfg_get ANTHROPIC_SMALL_FAST_MODEL)" = "$old" ] && { cfg_set ANTHROPIC_SMALL_FAST_MODEL "$new"; changed=1; }
+  [ "$changed" = "1" ] && persist_current
+}
+
+# Print the model list as a numbered menu; marks the current primary / small.
+models_print() {
+  local list; list="$(models_all)"
+  local primary small; primary="$(effective_or_cfg ANTHROPIC_MODEL)"; small="$(effective_or_cfg ANTHROPIC_SMALL_FAST_MODEL)"
+  if [ -z "$list" ]; then
+    echo "   ${C_DIM}(空 —— 用 'a' 添加，或从预置平台导入)${C_RESET}"
+    return
+  fi
+  local i=0 m tag
+  while IFS= read -r m; do
+    i=$((i+1)); tag=""
+    [ "$m" = "$primary" ] && tag="${tag} ${C_GREEN}[主]${C_RESET}"
+    [ "$m" = "$small" ] && tag="${tag} ${C_CYAN}[快速]${C_RESET}"
+    printf '   %2d) %s%s\n' "$i" "$m" "$tag"
+  done <<EOF
+$list
+EOF
+}
+
+# nth model (1-based) -> stdout
+models_nth() { models_all | sed -n "${1}p"; }
+
+# effective value for a key: in-memory edit map, then config.env, then settings.json
+effective_or_cfg() {
+  local v; v="$(cfg_get "$1")"
+  [ -n "$v" ] && { printf '%s' "$v"; return; }
+  v="$(config_get "$1")"
+  [ -n "$v" ] && { printf '%s' "$v"; return; }
+  _settings_read_key "$(json_tool)" "$1"
+}
+
+# Fill the CFG_* map with the union of what is currently stored (config.env wins,
+# then settings.json). Used by the standalone model manager so re-persisting does
+# not wipe keys that live only in one of the two stores.
+load_cfg_effective() {
+  local k v tool; tool="$(json_tool)"
+  for k in "${MANAGED_KEYS[@]}"; do
+    v="$(config_get "$k")"
+    [ -z "$v" ] && v="$(_settings_read_key "$tool" "$k")"
+    cfg_set "$k" "$v"
+  done
+}
+
+# Write the current CFG_* map back to whichever stores already exist.
+persist_current() {
+  local did=0 tool; tool="$(json_tool)"
+  if [ -f "$CLAUDE_SETTINGS_FILE" ] && \
+     [ -n "$(_settings_read_key "$tool" ANTHROPIC_BASE_URL)$(_settings_read_key "$tool" ANTHROPIC_MODEL)$(_settings_read_key "$tool" ANTHROPIC_SMALL_FAST_MODEL)" ]; then
+    apply_settings_json && did=1
+  fi
+  if [ -f "$CONFIG_FILE" ]; then
+    write_config_env && did=1
+  fi
+  [ "$did" = "0" ] && { warn "尚无已保存的写入位置；请先运行「配置 MaaS 连接」保存一次。"; return 1; }
+  return 0
+}
+
+# Point ANTHROPIC_MODEL / ANTHROPIC_SMALL_FAST_MODEL at a model name and persist.
+models_set_pointer() {
+  local key="$1" name="$2"
+  load_cfg_effective
+  cfg_set "$key" "$name"
+  if persist_current; then
+    if [ -z "$name" ]; then ok "已清空 $key"; else ok "$key = $name"; fi
+  else
+    warn "$key 暂存为 '$name'，但尚未落盘。请先「配置 MaaS 连接」。"
+  fi
+}
+
+# Look up a preset row by key -> "display|base_url|help_url" on stdout
+preset_row() {
+  local key="$1" row
+  for row in "${PRESETS[@]}"; do
+    case "$row" in "$key|"*) printf '%s' "${row#*|}"; return 0 ;; esac
+  done
+  return 1
+}
+
+# 1-based position of a model name in the list (0 if absent)
+models_index_of() {
+  local want="$1" i=0 m
+  while IFS= read -r m; do
+    i=$((i+1)); [ "$m" = "$want" ] && { printf '%s' "$i"; return 0; }
+  done < <(models_all)
+  printf '0'
+}
+
+# Interactive model chooser. Prompts on stderr, prints the chosen name on stdout.
+# Picking a number selects from the list; 'm' or a free string adds a new one; 0 clears.
+pick_model() {
+  local label="$1" current="${2-}" list sel manual picked
+  list="$(models_all)"
+  {
+    echo
+    echo "$label"
+    if [ -n "$list" ]; then
+      local i=0 m
+      while IFS= read -r m; do
+        i=$((i+1))
+        if [ "$m" = "$current" ]; then printf '  %2d) %s  %s<- 当前%s\n' "$i" "$m" "$C_DIM" "$C_RESET"
+        else printf '  %2d) %s\n' "$i" "$m"; fi
+      done <<EOF
+$list
+EOF
+    else
+      echo "  ${C_DIM}(模型列表为空 —— 直接输入模型名即可加入列表)${C_RESET}"
+    fi
+    echo "   m) 手动输入新模型名 (并加入列表)"
+    echo "   0) 留空 (用 Claude Code 默认)"
+  } >&2
+  local def; def="$(models_index_of "$current")"; [ "$def" = "0" ] && def="0"
+  sel="$(ask '选择' "$def")"
+  case "$sel" in
+    0|"") printf '' ;;
+    m|M)
+      manual="$(ask '模型名')"
+      [ -n "$manual" ] && models_add "$manual" >&2
+      printf '%s' "$manual"
+      ;;
+    *)
+      if printf '%s' "$sel" | grep -qE '^[0-9]+$'; then
+        picked="$(models_nth "$sel")"
+        if [ -n "$picked" ]; then printf '%s' "$picked"; else warn "序号超出范围，按留空处理"; printf ''; fi
+      else
+        models_add "$sel" >&2
+        printf '%s' "$sel"
+      fi
+      ;;
+  esac
+}
+
+# --------------------------------------------------------------------------- #
+# Model list manager (menu + `claude-maas model ...`)
+# --------------------------------------------------------------------------- #
+manage_models() {
+  while true; do
+    hr
+    echo "${C_BOLD}模型列表${C_RESET}   ${C_DIM}($MODELS_FILE)${C_RESET}"
+    models_print
+    echo
+    echo "  a) 添加    d) 删除(名称或序号)    e) 改名    p) 设为主模型    s) 设为快速模型"
+    echo "  c) 清空    i) 从预置平台导入示例    0) 返回"
+    hr
+    local op; op="$(ask '操作' '')"
+    case "$op" in
+      a) local n; n="$(ask '新模型名')"; [ -n "$n" ] && models_add "$n" ;;
+      d) local n; n="$(ask '要删除的模型名或序号')"; [ -n "$n" ] && models_remove "$n" ;;
+      e) local o x; o="$(ask '旧名 (或序号)')"; [ "$o" -gt 0 ] 2>/dev/null && o="$(models_nth "$o")"
+         [ -n "$o" ] && { x="$(ask "新名 (原: $o)")"; models_rename "$o" "$x"; } ;;
+      p) local n; n="$(pick_model '设为主模型 ANTHROPIC_MODEL' "$(effective_or_cfg ANTHROPIC_MODEL)")"; models_set_pointer ANTHROPIC_MODEL "$n" ;;
+      s) local n; n="$(pick_model '设为快速模型 ANTHROPIC_SMALL_FAST_MODEL' "$(effective_or_cfg ANTHROPIC_SMALL_FAST_MODEL)")"; models_set_pointer ANTHROPIC_SMALL_FAST_MODEL "$n" ;;
+      c) confirm "清空整个模型列表?" "N" && { : | models_save; ok "已清空"; } ;;
+      i)
+        echo "预置平台:"
+        local i=0 row
+        for row in "${PRESETS[@]}"; do
+          i=$((i+1)); printf '  %d) %s\n' "$i" "$(printf '%s' "$row" | awk -F'|' '{print $2}')"
+        done
+        local s; s="$(ask '选择平台序号' '')"
+        row=""
+        printf '%s' "$s" | grep -qE '^[1-9][0-9]*$' && [ "$s" -le "${#PRESETS[@]}" ] && \
+          row="$(printf '%s\n' "${PRESETS[@]}" | sed -n "${s}p")"
+        if [ -n "$row" ]; then
+          local hlp; hlp="$(printf '%s' "$row" | awk -F'|' '{print $4}')"
+          warn "本工具不内置各家的具体模型名（更新频繁）。"
+          [ "$hlp" != "-" ] && [ -n "$hlp" ] && info "请到该平台文档查模型名: $hlp"
+          local mm; mm="$(ask '现在手动输入一个该平台模型名 (可留空)')"
+          [ -n "$mm" ] && models_add "$mm"
+        fi
+        ;;
+      0|q|Q|"") return ;;
+      *) err "无效操作" ;;
+    esac
+  done
+}
+
+# `claude-maas model[s] ...`
+models_cli() {
+  local sub="${1-}"; shift 2>/dev/null || true
+  case "$sub" in
+    ""|list|ls)     models_all ;;
+    add)            [ -n "${1-}" ] || { err "用法: claude-maas model add <名称> [名称...]"; return 2; }
+                    local m; for m in "$@"; do models_add "$m"; done ;;
+    rm|remove|del)  [ -n "${1-}" ] || { err "用法: claude-maas model rm <名称|序号>"; return 2; }
+                    local m; for m in "$@"; do models_remove "$m"; done ;;
+    edit|rename|mv) models_rename "${1-}" "${2-}" ;;
+    primary|main)   [ -n "${1-}" ] || { err "用法: claude-maas model primary <名称>"; return 2; }
+                    models_set_pointer ANTHROPIC_MODEL "$1" ;;
+    small|fast)     [ -n "${1-}" ] || { err "用法: claude-maas model small <名称>"; return 2; }
+                    models_set_pointer ANTHROPIC_SMALL_FAST_MODEL "$1" ;;
+    edit-menu|menu|"-") manage_models ;;
+    *) err "未知子命令: $sub"; echo "可用: list | add | rm | edit | primary | small | menu"; return 2 ;;
+  esac
+}
+
 configure_maas() {
   hr
   echo "${C_BOLD}配置 MaaS 连接${C_RESET}"
   echo "${C_DIM}留空表示不设置 / 清除该项。Token 输入时不回显。${C_RESET}"
   echo
 
-  load_cfg_into_map
+  load_cfg_effective
 
   local base token apikey model small
-  base="$(ask 'ANTHROPIC_BASE_URL  (MaaS 接口地址, 形如 https://your-maas.example.com/api)' "$(cfg_get ANTHROPIC_BASE_URL)")"
+  local cur_base; cur_base="$(cfg_get ANTHROPIC_BASE_URL)"
+
+  # --- 1. 选择 MaaS 平台 ------------------------------------------------------
+  echo "选择 MaaS 平台 (预置地址仅为便捷，以各家官方文档为准):"
+  local i=0 row key disp url help
+  for row in "${PRESETS[@]}"; do
+    i=$((i+1))
+    key="${row%%|*}"; disp="$(printf '%s' "$row" | awk -F'|' '{print $2}')"
+    url="$(printf '%s' "$row" | awk -F'|' '{print $3}')"
+    if [ "$url" = "-" ]; then printf '  %d) %s\n' "$i" "$disp"
+    else printf '  %d) %-26s %s%s%s\n' "$i" "$disp" "$C_DIM" "$url" "$C_RESET"; fi
+  done
+  local pdef=1 j=0
+  for row in "${PRESETS[@]}"; do
+    j=$((j+1)); url="$(printf '%s' "$row" | awk -F'|' '{print $3}')"
+    [ -n "$cur_base" ] && [ "$url" = "$cur_base" ] && pdef=$j
+  done
+  local psel; psel="$(ask '输入序号' "$pdef")"
+  if ! printf '%s' "$psel" | grep -qE '^[1-9][0-9]*$' || [ "$psel" -gt "${#PRESETS[@]}" ]; then
+    err "无效选项"; pause; return
+  fi
+  row="$(printf '%s\n' "${PRESETS[@]}" | sed -n "${psel}p")"
+  [ -z "$row" ] && { err "无效选项"; pause; return; }
+  key="${row%%|*}"
+  url="$(printf '%s' "$row" | awk -F'|' '{print $3}')"
+  help="$(printf '%s' "$row" | awk -F'|' '{print $4}')"
+
+  if [ "$key" = "custom" ] || [ "$url" = "-" ]; then
+    base="$(ask 'ANTHROPIC_BASE_URL  (形如 https://your-maas.example.com/api)' "$cur_base")"
+  else
+    base="$(ask "ANTHROPIC_BASE_URL  (回车用预置值)" "${url}")"
+    [ "$help" != "-" ] && [ -n "$help" ] && info "获取 API Key / 文档: $help"
+  fi
   base="${base%/}"
 
+  # --- 2. 鉴权 --------------------------------------------------------------
   echo
   echo "鉴权方式 (二选一，取决于你的 MaaS 平台):"
   echo "  1) Bearer Token  -> 写入 ANTHROPIC_AUTH_TOKEN (最常见)"
@@ -231,10 +538,11 @@ configure_maas() {
     apikey=""
   fi
 
+  # --- 3. 选择模型 (来自模型列表, 见菜单 6) --------------------------------
   echo
-  echo "${C_DIM}模型名称留空则使用 Claude Code 默认值。具体可用模型名以 MaaS 平台文档为准。${C_RESET}"
-  model="$(ask 'ANTHROPIC_MODEL           (主模型, 可留空)' "$(cfg_get ANTHROPIC_MODEL)")"
-  small="$(ask 'ANTHROPIC_SMALL_FAST_MODEL (轻量/快速模型, 可留空)' "$(cfg_get ANTHROPIC_SMALL_FAST_MODEL)")"
+  echo "${C_DIM}模型名各家不同。下面从你的「模型列表」里选；留空则用 Claude Code 默认值。${C_RESET}"
+  model="$(pick_model '主模型 ANTHROPIC_MODEL' "$(cfg_get ANTHROPIC_MODEL)")"
+  small="$(pick_model '快速模型 ANTHROPIC_SMALL_FAST_MODEL' "$(cfg_get ANTHROPIC_SMALL_FAST_MODEL)")"
 
   cfg_set ANTHROPIC_BASE_URL "$base"
   cfg_set ANTHROPIC_AUTH_TOKEN "$token"
@@ -376,12 +684,19 @@ apply_env_files() {
 }
 
 # --- writer: ~/.claude/settings.json env block ---------------------------- #
+# Pick a JSON tool that ACTUALLY works (Windows ships a python3 "app execution
+# alias" stub that is on PATH but does nothing). Result is cached per run.
+JSON_TOOL_CACHE=""
 json_tool() {
-  if has_cmd jq; then echo jq
-  elif has_cmd python3; then echo python3
-  elif has_cmd python; then echo python
-  elif has_cmd node; then echo node
-  else echo none; fi
+  [ -n "$JSON_TOOL_CACHE" ] && { printf '%s' "$JSON_TOOL_CACHE"; return; }
+  local t=none
+  if has_cmd jq && printf '{}' | jq -e . >/dev/null 2>&1; then t=jq
+  elif has_cmd node && node -e 'JSON.parse("{}")' >/dev/null 2>&1; then t=node
+  elif has_cmd python3 && python3 -c 'import json' >/dev/null 2>&1; then t=python3
+  elif has_cmd python && python -c 'import json' >/dev/null 2>&1; then t=python
+  fi
+  JSON_TOOL_CACHE="$t"
+  printf '%s' "$t"
 }
 
 apply_settings_json() {
@@ -393,15 +708,19 @@ apply_settings_json() {
   fi
 
   mkdir -p "$CLAUDE_SETTINGS_DIR"
-  [ -f "$CLAUDE_SETTINGS_FILE" ] || echo '{}' > "$CLAUDE_SETTINGS_FILE"
 
-  # sanity: existing file must be valid JSON, otherwise stop (never clobber).
-  if ! _json_valid "$tool" "$CLAUDE_SETTINGS_FILE"; then
-    err "$CLAUDE_SETTINGS_FILE 不是合法 JSON，已跳过以免损坏。请手动修复后重试。"
-    return 1
+  # Protect a pre-existing, non-empty settings.json: if it does not parse, stop
+  # rather than risk clobbering real settings. A missing / empty file is fine —
+  # we just start from {}.
+  if [ -s "$CLAUDE_SETTINGS_FILE" ] && grep -q '[^[:space:]]' "$CLAUDE_SETTINGS_FILE" 2>/dev/null; then
+    if ! _json_valid "$tool" "$CLAUDE_SETTINGS_FILE"; then
+      err "$CLAUDE_SETTINGS_FILE 不是合法 JSON，已跳过以免损坏。请手动修复后重试。"
+      return 1
+    fi
+    cp "$CLAUDE_SETTINGS_FILE" "$CLAUDE_SETTINGS_FILE.claude-maas.bak"
+  else
+    echo '{}' > "$CLAUDE_SETTINGS_FILE"
   fi
-
-  cp "$CLAUDE_SETTINGS_FILE" "$CLAUDE_SETTINGS_FILE.claude-maas.bak"
 
   # Build a KEY=VALUE list (only non-empty) + list of keys to delete (empty).
   local set_pairs=() del_keys=() k v
@@ -567,6 +886,10 @@ show_config() {
     fi
   done
   [ "$any" = "0" ] && echo "   ${C_DIM}(无 —— 需重开终端，或本终端未走受管配置)${C_RESET}"
+
+  echo
+  echo "${C_CYAN}4) 模型列表${C_RESET}  ($MODELS_FILE)"
+  models_print
 
   echo
   local b; b="$(claude_bin)"
@@ -751,8 +1074,10 @@ banner() {
   local conf="${C_RED}未配置${C_RESET}"
   { [ -f "$CONFIG_FILE" ] || [ -n "$(_settings_read_key "$(json_tool)" ANTHROPIC_BASE_URL)" ]; } && conf="${C_GREEN}已配置${C_RESET}"
   local self="${C_DIM}(本次为一次性运行)${C_RESET}"; [ -f "$SELF_INSTALL_PATH" ] && self="${C_GREEN}claude-maas 命令已安装${C_RESET}"
+  local nm; nm="$(models_count 2>/dev/null || echo 0)"
   printf '  Claude Code : %s\n' "$cs"
   printf '  MaaS 配置   : %s\n' "$conf"
+  printf '  模型列表    : %s 个\n' "$nm"
   printf '  管理命令    : %s\n' "$self"
   hr
 }
@@ -762,10 +1087,11 @@ menu() {
     banner
     cat <<EOF
   ${C_BOLD}1${C_RESET})  安装 / 更新 Claude Code CLI
-  ${C_BOLD}2${C_RESET})  配置 MaaS 连接 (Base URL / Token / 模型)
+  ${C_BOLD}2${C_RESET})  配置 MaaS 连接 (平台 / Token / 模型)
   ${C_BOLD}3${C_RESET})  查看当前配置
   ${C_BOLD}4${C_RESET})  测试连接
   ${C_BOLD}5${C_RESET})  启动 Claude Code
+  ${C_BOLD}6${C_RESET})  管理模型列表 (增 / 删 / 改 / 设主/快速)
   ${C_BOLD}8${C_RESET})  安装 / 更新 "claude-maas" 管理命令
   ${C_BOLD}9${C_RESET})  卸载 (配置 / 管理命令 / 可选卸载 CLI)
   ${C_BOLD}0${C_RESET})  退出
@@ -784,6 +1110,7 @@ EOF
       3) show_config ;;
       4) test_connection ;;
       5) run_claude ;;
+      6) manage_models ;;
       8) install_self; pause ;;
       9) uninstall_all ;;
       0|q|Q) echo "bye."; exit 0 ;;
@@ -810,22 +1137,34 @@ claude-maas v$VERSION — Claude Code CLI + MaaS 一键安装 / 管理
   claude-maas self-install    把本脚本安装为 'claude-maas' 命令
   claude-maas uninstall       移除配置 / 管理命令
   claude-maas help            显示本帮助
+
+模型列表:
+  claude-maas models                     列出所有模型
+  claude-maas model add <名称> [名称...]  添加
+  claude-maas model rm  <名称|序号>       删除
+  claude-maas model edit <旧名> <新名>    改名
+  claude-maas model primary <名称>       设为主模型 (ANTHROPIC_MODEL)
+  claude-maas model small   <名称>       设为快速模型 (ANTHROPIC_SMALL_FAST_MODEL)
+  claude-maas model menu                 打开模型列表管理菜单
 EOF
 }
 
 main() {
-  case "${1-}" in
+  local cmd="${1-}"; [ "$#" -gt 0 ] && shift
+  case "$cmd" in
     ""|menu)        menu ;;
     install)        install_claude_code ;;
     config|configure) configure_maas ;;
     show|status)    show_config ;;
     test)           test_connection ;;
     run)            run_claude ;;
+    models)         models_cli list ;;
+    model)          models_cli "$@" ;;
     self-install)   install_self ;;
     uninstall|remove) uninstall_all ;;
     -h|--help|help) usage ;;
     -v|--version)   echo "$VERSION" ;;
-    *) err "未知命令: $1"; echo; usage; exit 2 ;;
+    *) err "未知命令: $cmd"; echo; usage; exit 2 ;;
   esac
 }
 
