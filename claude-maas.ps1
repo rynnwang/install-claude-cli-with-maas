@@ -45,6 +45,18 @@ $script:ManagedKeys = @(
 )
 $script:SecretKeys = @('ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY')
 
+$script:ModelsFile = Join-Path $script:ConfigDir 'models.txt'
+
+# Built-in MaaS presets. 预置地址仅为便捷，以各家官方文档为准。
+$script:Presets = @(
+  [pscustomobject]@{ Key='anthropic'; Name='Anthropic 官方';          Url='https://api.anthropic.com';                          Help='https://console.anthropic.com/settings/keys' }
+  [pscustomobject]@{ Key='wanjie';    Name='万界方舟 WanJie Ark';      Url='https://maas-openapi.wanjiedata.com/api/anthropic';   Help='https://www.wjark.com/center/api-key' }
+  [pscustomobject]@{ Key='deepseek';  Name='DeepSeek';                 Url='https://api.deepseek.com/anthropic';                  Help='https://platform.deepseek.com/api_keys' }
+  [pscustomobject]@{ Key='moonshot';  Name='月之暗面 Kimi / Moonshot'; Url='https://api.moonshot.cn/anthropic';                   Help='https://platform.moonshot.cn/console/api-keys' }
+  [pscustomobject]@{ Key='zhipu';     Name='智谱 GLM / BigModel';       Url='https://open.bigmodel.cn/api/anthropic';              Help='https://open.bigmodel.cn/usercenter/apikeys' }
+  [pscustomobject]@{ Key='custom';    Name='自定义 / 其它';            Url='';                                                    Help='' }
+)
+
 # --------------------------------------------------------------------------- #
 # Output helpers
 # --------------------------------------------------------------------------- #
@@ -70,10 +82,16 @@ function Read-Secret {
     if ($Current.Length -le 8) { $hint = ' (已有值，直接回车保留)' }
     else { $hint = " (已有 $($Current.Substring(0,4))…$($Current.Substring($Current.Length-4))，回车保留)" }
   }
-  $sec = Read-Host ("{0}{1}" -f $Prompt, $hint) -AsSecureString
-  $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-  try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
-  finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+  $plain = ''
+  if ([Console]::IsInputRedirected) {
+    # No console to mask against (piped stdin) — read plainly rather than hang.
+    $plain = Read-Host ("{0}{1}" -f $Prompt, $hint)
+  } else {
+    $sec = Read-Host ("{0}{1}" -f $Prompt, $hint) -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+    try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+  }
   if ([string]::IsNullOrEmpty($plain)) { return $Current }
   return $plain
 }
@@ -136,6 +154,233 @@ function Write-ConfigMap {
   }
   Write-TextNoBom -Path $script:ConfigFile -Lines $lines
   Write-Ok "已写入 $script:ConfigFile"
+}
+
+# --------------------------------------------------------------------------- #
+# Model list  (%USERPROFILE%\.config\claude-maas\models.txt, one name per line)
+# --------------------------------------------------------------------------- #
+function Get-ModelList {
+  if (-not (Test-Path $script:ModelsFile)) { return @() }
+  $seen = @{}; $out = @()
+  foreach ($l in Get-Content -LiteralPath $script:ModelsFile) {
+    $t = $l.Trim()
+    if ($t -eq '' -or $t.StartsWith('#')) { continue }
+    if (-not $seen.ContainsKey($t)) { $seen[$t] = $true; $out += $t }
+  }
+  return $out
+}
+
+function Save-ModelList {
+  param([string[]]$Models)
+  New-Item -ItemType Directory -Force -Path $script:ConfigDir | Out-Null
+  $seen = @{}; $clean = @()
+  foreach ($m in $Models) {
+    if ($null -eq $m) { continue }
+    $t = ([string]$m).Trim()
+    if ($t -eq '' -or $seen.ContainsKey($t)) { continue }
+    $seen[$t] = $true; $clean += $t
+  }
+  Write-TextNoBom -Path $script:ModelsFile -Lines $clean
+}
+
+function Add-Model {
+  param([string]$Name)
+  $n = ([string]$Name).Trim()
+  if (-not $n) { Write-Err2 "空的模型名"; return }
+  $list = @(Get-ModelList)
+  if ($list -contains $n) { Write-Warn2 "已存在: $n"; return }
+  Save-ModelList ($list + $n)
+  Write-Ok "已添加模型: $n"
+}
+
+function Remove-Model {
+  param([string]$Arg)   # exact name OR 1-based index
+  $list = @(Get-ModelList)
+  if ($list.Count -eq 0) { Write-Warn2 "模型列表为空"; return }
+  $target = $Arg
+  if ($Arg -match '^\d+$') {
+    $i = [int]$Arg
+    if ($i -ge 1 -and $i -le $list.Count) { $target = $list[$i-1] } else { $target = $null }
+  }
+  if (-not $target -or ($list -notcontains $target)) { Write-Warn2 "未找到: $Arg"; return }
+  Save-ModelList ($list | Where-Object { $_ -ne $target })
+  Write-Ok "已删除: $target"
+  if ((Resolve-EffectiveOrCfg 'ANTHROPIC_MODEL') -eq $target) { Write-Warn2 "注意: 主模型仍指向已删除的 '$target'，请重设。" }
+  if ((Resolve-EffectiveOrCfg 'ANTHROPIC_SMALL_FAST_MODEL') -eq $target) { Write-Warn2 "注意: 快速模型仍指向已删除的 '$target'。" }
+}
+
+function Rename-Model {
+  param([string]$Old, [string]$New)
+  $n = ([string]$New).Trim()
+  if (-not $n) { Write-Err2 "用法: model edit <旧名> <新名>"; return }
+  $list = @(Get-ModelList)
+  if ($list -notcontains $Old) { Write-Err2 "未找到: $Old"; return }
+  Save-ModelList ($list | ForEach-Object { if ($_ -eq $Old) { $n } else { $_ } })
+  Write-Ok "已改名: $Old -> $n"
+  $map = Get-UnionConfig
+  $changed = $false
+  if ($map['ANTHROPIC_MODEL'] -eq $Old) { $map['ANTHROPIC_MODEL'] = $n; $changed = $true }
+  if ($map['ANTHROPIC_SMALL_FAST_MODEL'] -eq $Old) { $map['ANTHROPIC_SMALL_FAST_MODEL'] = $n; $changed = $true }
+  if ($changed) { [void](Persist-Config $map) }
+}
+
+# in-memory union of what's stored (config.env wins, then settings.json)
+function Get-UnionConfig {
+  $map = @{}
+  $sj = Read-SettingsEnv
+  $cf = Get-ConfigMap
+  foreach ($k in $script:ManagedKeys) {
+    if ($cf.ContainsKey($k) -and $cf[$k]) { $map[$k] = $cf[$k] }
+    elseif ($sj -and $sj.ContainsKey($k) -and $sj[$k]) { $map[$k] = $sj[$k] }
+    else { $map[$k] = '' }
+  }
+  return $map
+}
+
+# value for a key: session env, then config.env, then settings.json
+function Resolve-EffectiveOrCfg {
+  param([string]$Key)
+  $v = [Environment]::GetEnvironmentVariable($Key)
+  if ($v) { return $v }
+  $cf = Get-ConfigMap
+  if ($cf.ContainsKey($Key) -and $cf[$Key]) { return [string]$cf[$Key] }
+  $sj = Read-SettingsEnv
+  if ($sj -and $sj.ContainsKey($Key) -and $sj[$Key]) { return [string]$sj[$Key] }
+  return ''
+}
+
+# write the map back to whichever stores already exist; $false if none
+function Persist-Config {
+  param([hashtable]$Map)
+  $did = $false
+  $sj = Read-SettingsEnv
+  if ((Test-Path $script:ClaudeSettings) -and $sj -and ($sj['ANTHROPIC_BASE_URL'] -or $sj['ANTHROPIC_MODEL'] -or $sj['ANTHROPIC_SMALL_FAST_MODEL'])) {
+    if (Save-SettingsEnv $Map) { $did = $true }
+  }
+  if (Test-Path $script:ConfigFile) { Write-ConfigMap $Map; $did = $true }
+  if (-not $did) { Write-Warn2 "尚无已保存的写入位置；请先运行「配置 MaaS 连接」保存一次。" }
+  return $did
+}
+
+function Set-ModelPointer {
+  param([string]$Key, [string]$Name)
+  $map = Get-UnionConfig
+  $map[$Key] = $Name
+  if (Persist-Config $map) {
+    if ($Name) { Write-Ok "$Key = $Name" } else { Write-Ok "已清空 $Key" }
+  } else {
+    Write-Warn2 "$Key 暂存为 '$Name'，但尚未落盘。请先「配置 MaaS 连接」。"
+  }
+}
+
+function Write-ModelList {
+  $list = @(Get-ModelList)
+  $primary = Resolve-EffectiveOrCfg 'ANTHROPIC_MODEL'
+  $small   = Resolve-EffectiveOrCfg 'ANTHROPIC_SMALL_FAST_MODEL'
+  if ($list.Count -eq 0) { Write-Host "   (空 —— 用 'a' 添加，或直接输入模型名)" -ForegroundColor DarkGray; return }
+  for ($i = 0; $i -lt $list.Count; $i++) {
+    $tag = ''
+    if ($list[$i] -eq $primary) { $tag += ' [主]' }
+    if ($list[$i] -eq $small)   { $tag += ' [快速]' }
+    "   {0,2}) {1}{2}" -f ($i+1), $list[$i], $tag | Write-Host
+  }
+}
+
+# Interactive chooser: returns chosen model name ('' = clear).
+function Select-Model {
+  param([string]$Label, [string]$Current = '')
+  $list = @(Get-ModelList)
+  Write-Host ''
+  Write-Host $Label
+  if ($list.Count -gt 0) {
+    for ($i = 0; $i -lt $list.Count; $i++) {
+      if ($list[$i] -eq $Current) { "  {0,2}) {1}  <- 当前" -f ($i+1), $list[$i] | Write-Host }
+      else { "  {0,2}) {1}" -f ($i+1), $list[$i] | Write-Host }
+    }
+  } else {
+    Write-Host "  (模型列表为空 —— 直接输入模型名即可加入列表)" -ForegroundColor DarkGray
+  }
+  Write-Host "   m) 手动输入新模型名 (并加入列表)"
+  Write-Host "   0) 留空 (用 Claude Code 默认)"
+  $def = '0'
+  if ($Current -and ($list -contains $Current)) { $def = [string](([array]::IndexOf($list, $Current)) + 1) }
+  $sel = Read-WithDefault '选择' $def
+  if ($sel -eq '0' -or $sel -eq '') { return '' }
+  if ($sel -eq 'm' -or $sel -eq 'M') {
+    $manual = Read-WithDefault '模型名' ''
+    if ($manual) { Add-Model $manual }
+    return $manual
+  }
+  if ($sel -match '^\d+$') {
+    $i = [int]$sel
+    if ($i -ge 1 -and $i -le $list.Count) { return $list[$i-1] }
+    Write-Warn2 "序号超出范围，按留空处理"; return ''
+  }
+  Add-Model $sel
+  return $sel
+}
+
+function Manage-Models {
+  $blanks = 0
+  while ($true) {
+    Write-Hr
+    Write-Host "模型列表   ($script:ModelsFile)" -ForegroundColor White
+    Write-ModelList
+    Write-Host ''
+    Write-Host "  a) 添加   d) 删除(名称或序号)   e) 改名   p) 设为主模型   s) 设为快速模型"
+    Write-Host "  c) 清空   i) 查看预置平台文档链接   0) 返回"
+    Write-Hr
+    $op = Read-Host '操作'
+    if ([string]::IsNullOrEmpty($op)) {
+      if ([Console]::IsInputRedirected -and (++$blanks -ge 3)) { return }
+      continue
+    }
+    $blanks = 0
+    switch ($op) {
+      'a' { $n = Read-Host '新模型名'; if ($n) { Add-Model $n } }
+      'd' { $n = Read-Host '要删除的模型名或序号'; if ($n) { Remove-Model $n } }
+      'e' {
+        $o = Read-Host '旧名 (或序号)'
+        $list = @(Get-ModelList)
+        if ($o -match '^\d+$' -and [int]$o -ge 1 -and [int]$o -le $list.Count) { $o = $list[[int]$o - 1] }
+        if ($o) { $x = Read-Host "新名 (原: $o)"; Rename-Model $o $x }
+      }
+      'p' { $n = Select-Model '设为主模型 ANTHROPIC_MODEL' (Resolve-EffectiveOrCfg 'ANTHROPIC_MODEL'); Set-ModelPointer 'ANTHROPIC_MODEL' $n }
+      's' { $n = Select-Model '设为快速模型 ANTHROPIC_SMALL_FAST_MODEL' (Resolve-EffectiveOrCfg 'ANTHROPIC_SMALL_FAST_MODEL'); Set-ModelPointer 'ANTHROPIC_SMALL_FAST_MODEL' $n }
+      'c' { if (Confirm-YN "清空整个模型列表?" 'N') { Save-ModelList @(); Write-Ok "已清空" } }
+      'i' {
+        foreach ($p in $script:Presets) { if ($p.Help) { "  {0,-24} {1}" -f $p.Name, $p.Help | Write-Host } }
+        Write-Warn2 "本工具不内置各家的具体模型名（更新频繁），请到上述文档查。"
+        $mm = Read-Host '现在手动输入一个模型名 (可留空)'
+        if ($mm) { Add-Model $mm }
+      }
+      '0' { return }
+      'q' { return }
+      default { if ($op) { Write-Err2 "无效操作" } }
+    }
+  }
+}
+
+# `claude-maas model[s] ...`
+function Invoke-ModelsCli {
+  param([object[]]$Rest)
+  $r   = @($Rest)                              # force array (PS unwraps singletons)
+  $sub = if ($r.Count -ge 1) { [string]$r[0] } else { '' }
+  $a   = @($r | Select-Object -Skip 1)         # remaining args, always an array
+  switch ($sub) {
+    { $_ -in @('', 'list', 'ls') } { Get-ModelList | ForEach-Object { $_ }; break }
+    'add'    { if ($a.Count -eq 0) { Write-Err2 "用法: claude-maas model add <名称> [名称...]"; return }
+               foreach ($m in $a) { Add-Model $m }; break }
+    { $_ -in @('rm','remove','del') } { if ($a.Count -eq 0) { Write-Err2 "用法: claude-maas model rm <名称|序号>"; return }
+               foreach ($m in $a) { Remove-Model $m }; break }
+    { $_ -in @('edit','rename','mv') } { Rename-Model ([string]$a[0]) ([string]$a[1]); break }
+    { $_ -in @('primary','main') } { if ($a.Count -eq 0) { Write-Err2 "用法: claude-maas model primary <名称>"; return }
+               Set-ModelPointer 'ANTHROPIC_MODEL' ([string]$a[0]); break }
+    { $_ -in @('small','fast') } { if ($a.Count -eq 0) { Write-Err2 "用法: claude-maas model small <名称>"; return }
+               Set-ModelPointer 'ANTHROPIC_SMALL_FAST_MODEL' ([string]$a[0]); break }
+    { $_ -in @('menu','edit-menu') } { Manage-Models; break }
+    default  { Write-Err2 "未知子命令: $sub"; Write-Host "可用: list | add | rm | edit | primary | small | menu" }
+  }
 }
 
 # --------------------------------------------------------------------------- #
@@ -295,13 +540,36 @@ function Configure-Maas {
   Write-Host "留空表示不设置 / 清除该项。Token 输入时不回显。" -ForegroundColor DarkGray
   Write-Host ''
 
-  $cur = Get-ConfigMap
-  $sj  = Read-SettingsEnv
-  if ($sj) { foreach ($k in $sj.Keys) { if (-not $cur.ContainsKey($k) -or -not $cur[$k]) { $cur[$k] = $sj[$k] } } }
+  $cur = Get-UnionConfig
+  $curBase = [string]$cur['ANTHROPIC_BASE_URL']
 
-  $base = Read-WithDefault 'ANTHROPIC_BASE_URL  (MaaS 接口地址, 形如 https://your-maas.example.com/api)' ([string]$cur['ANTHROPIC_BASE_URL'])
+  # --- 1. 选择 MaaS 平台 ---------------------------------------------------
+  Write-Host "选择 MaaS 平台 (预置地址仅为便捷，以各家官方文档为准):"
+  for ($i = 0; $i -lt $script:Presets.Count; $i++) {
+    $p = $script:Presets[$i]
+    if ($p.Url) { "  {0}) {1,-26} {2}" -f ($i+1), $p.Name, $p.Url | Write-Host }
+    else        { "  {0}) {1}" -f ($i+1), $p.Name | Write-Host }
+  }
+  $pdef = 1
+  for ($i = 0; $i -lt $script:Presets.Count; $i++) {
+    if ($curBase -and $script:Presets[$i].Url -eq $curBase) { $pdef = $i + 1 }
+  }
+  $psel = Read-WithDefault '输入序号' ([string]$pdef)
+  $preset = $null
+  if ($psel -match '^\d+$' -and [int]$psel -ge 1 -and [int]$psel -le $script:Presets.Count) {
+    $preset = $script:Presets[[int]$psel - 1]
+  }
+  if (-not $preset) { Write-Err2 "无效选项"; Pause-Menu; return }
+
+  if ($preset.Key -eq 'custom' -or -not $preset.Url) {
+    $base = Read-WithDefault 'ANTHROPIC_BASE_URL  (形如 https://your-maas.example.com/api)' $curBase
+  } else {
+    $base = Read-WithDefault 'ANTHROPIC_BASE_URL  (回车用预置值)' $preset.Url
+    if ($preset.Help) { Write-Info "获取 API Key / 文档: $($preset.Help)" }
+  }
   $base = $base.TrimEnd('/')
 
+  # --- 2. 鉴权 ----------------------------------------------------------
   Write-Host ''
   Write-Host "鉴权方式 (取决于你的 MaaS 平台):"
   Write-Host "  1) Bearer Token  -> ANTHROPIC_AUTH_TOKEN (最常见)"
@@ -314,10 +582,11 @@ function Configure-Maas {
     $token = Read-Secret 'ANTHROPIC_AUTH_TOKEN' ([string]$cur['ANTHROPIC_AUTH_TOKEN'])
   }
 
+  # --- 3. 选择模型 (来自模型列表, 见菜单 6) ---------------------------
   Write-Host ''
-  Write-Host "模型名称留空则使用 Claude Code 默认值；具体可用模型以 MaaS 平台文档为准。" -ForegroundColor DarkGray
-  $model = Read-WithDefault 'ANTHROPIC_MODEL            (主模型, 可留空)' ([string]$cur['ANTHROPIC_MODEL'])
-  $small = Read-WithDefault 'ANTHROPIC_SMALL_FAST_MODEL (轻量/快速模型, 可留空)' ([string]$cur['ANTHROPIC_SMALL_FAST_MODEL'])
+  Write-Host "模型名各家不同。下面从你的「模型列表」里选；留空则用 Claude Code 默认值。" -ForegroundColor DarkGray
+  $model = Select-Model '主模型 ANTHROPIC_MODEL' ([string]$cur['ANTHROPIC_MODEL'])
+  $small = Select-Model '快速模型 ANTHROPIC_SMALL_FAST_MODEL' ([string]$cur['ANTHROPIC_SMALL_FAST_MODEL'])
 
   $map = @{}
   foreach ($k in $script:ManagedKeys) { $map[$k] = [string]$cur[$k] }
@@ -409,6 +678,10 @@ function Show-Config {
     }
   }
   if (-not $any) { Write-Host "   (无 —— 需重开窗口，或本会话未走受管配置)" -ForegroundColor DarkGray }
+
+  Write-Host ''
+  Write-Host "5) 模型列表  ($script:ModelsFile)" -ForegroundColor Cyan
+  Write-ModelList
 
   Write-Host ''
   $b = Get-ClaudeCmd
@@ -643,30 +916,40 @@ function Show-Banner {
   $configured = ($sj -and $sj['ANTHROPIC_BASE_URL']) -or ($cf['ANTHROPIC_BASE_URL'])
   if ($configured) { Write-Host "  MaaS 配置   : 已配置" -ForegroundColor Green }
   else             { Write-Host "  MaaS 配置   : 未配置" -ForegroundColor Red }
+  $nm = @(Get-ModelList).Count
+  Write-Host "  模型列表    : $nm 个"
   if (Test-Path $script:SelfPs1) { Write-Host "  管理命令    : claude-maas 已安装" -ForegroundColor Green }
   else { Write-Host "  管理命令    : (本次为一次性运行)" -ForegroundColor DarkGray }
   Write-Hr
 }
 
 function Show-Menu {
+  $blanks = 0
   while ($true) {
     Show-Banner
     Write-Host "  1)  安装 / 更新 Claude Code CLI"
-    Write-Host "  2)  配置 MaaS 连接 (Base URL / Token / 模型)"
+    Write-Host "  2)  配置 MaaS 连接 (平台 / Token / 模型)"
     Write-Host "  3)  查看当前配置"
     Write-Host "  4)  测试连接"
     Write-Host "  5)  启动 Claude Code"
+    Write-Host "  6)  管理模型列表 (增 / 删 / 改 / 设主/快速)"
     Write-Host "  8)  安装 / 更新 ""claude-maas"" 管理命令"
     Write-Host "  9)  卸载 (配置 / 管理命令 / 可选卸载 CLI)"
     Write-Host "  0)  退出"
     Write-Hr
     $choice = Read-Host '请选择'
+    if ([string]::IsNullOrEmpty($choice)) {
+      if ([Console]::IsInputRedirected -and (++$blanks -ge 3)) { Write-Warn2 "标准输入已结束。"; return }
+      continue
+    }
+    $blanks = 0
     switch ($choice) {
       '1' { Install-ClaudeCode }
       '2' { Configure-Maas }
       '3' { Show-Config }
       '4' { Invoke-MaasTest }
       '5' { Invoke-Claude }
+      '6' { Manage-Models }
       '8' { Install-Self; Pause-Menu }
       '9' { Uninstall-All }
       '0' { Write-Host 'bye.'; return }
@@ -690,13 +973,23 @@ claude-maas v$script:Version — Claude Code CLI + MaaS 一键安装 / 管理 (W
   claude-maas self-install    安装为 'claude-maas' 命令 (函数 + .cmd shim)
   claude-maas uninstall       移除配置 / 管理命令
   claude-maas help            显示本帮助
+
+模型列表:
+  claude-maas models                     列出所有模型
+  claude-maas model add <名称> [名称...]  添加
+  claude-maas model rm  <名称|序号>       删除
+  claude-maas model edit <旧名> <新名>    改名
+  claude-maas model primary <名称>       设为主模型 (ANTHROPIC_MODEL)
+  claude-maas model small   <名称>       设为快速模型 (ANTHROPIC_SMALL_FAST_MODEL)
+  claude-maas model menu                 打开模型列表管理菜单
 "@ | Write-Host
 }
 
 # --------------------------------------------------------------------------- #
 # Entrypoint
 # --------------------------------------------------------------------------- #
-$cmd = if ($args.Count -ge 1) { [string]$args[0] } else { '' }
+$cmd  = if ($args.Count -ge 1) { [string]$args[0] } else { '' }
+$rest = if ($args.Count -ge 2) { $args[1..($args.Count-1)] } else { @() }
 
 # First run via `irm | iex`: offer to install the manager command.
 if (-not $cmd -and -not (Test-Path $script:SelfPs1)) {
@@ -715,6 +1008,8 @@ switch ($cmd) {
   'status'      { Show-Config }
   'test'        { Invoke-MaasTest }
   'run'         { Invoke-Claude }
+  'models'      { Invoke-ModelsCli @('list') }
+  'model'       { Invoke-ModelsCli $rest }
   'self-install'{ Install-Self }
   'uninstall'   { Uninstall-All }
   'remove'      { Uninstall-All }
